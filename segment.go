@@ -50,16 +50,18 @@ type segment struct {
 	totalExpired  int64      // used for debug
 	overwrites    int64      // used for debug
 	touched       int64      // used for debug
+	returnExpired bool       // if true, Get paths return expired entries instead of deleting them
 	vacuumLen     int64      // up to vacuumLen, new data can be written without overwriting old data.
 	slotLens      [256]int32 // The actual length for every slot.
 	slotCap       int32      // max number of entry pointers a slot can hold.
 	slotsData     []entryPtr // shared by all 256 slots
 }
 
-func newSegment(bufSize int, segId int, timer Timer) (seg segment) {
+func newSegment(bufSize int, segId int, timer Timer, returnExpired bool) (seg segment) {
 	seg.rb = NewRingBuf(bufSize, 0)
 	seg.segId = segId
 	seg.timer = timer
+	seg.returnExpired = returnExpired
 	seg.vacuumLen = int64(bufSize)
 	seg.slotCap = 1
 	seg.slotsData = make([]entryPtr, 256*seg.slotCap)
@@ -293,11 +295,16 @@ func (seg *segment) locate(key []byte, hashVal uint64, peek bool) (hdrEntry entr
 	if !peek {
 		now := seg.timer.Now()
 		if isExpired(hdr.expireAt, now) {
-			seg.delEntryPtr(slotId, slot, idx)
 			atomic.AddInt64(&seg.totalExpired, 1)
-			err = ErrNotFound
-			atomic.AddInt64(&seg.missCount, 1)
-			return
+			if !seg.returnExpired {
+				seg.delEntryPtr(slotId, slot, idx)
+				err = ErrNotFound
+				atomic.AddInt64(&seg.missCount, 1)
+				return
+			}
+			// Stale hit: return the entry without refreshing access time (LRU)
+			// or touching the stored header beyond the read above.
+			return *hdr, ptr.offset, nil
 		}
 		atomic.AddInt64(&seg.totalTime, int64(now-hdr.accessTime))
 		hdr.accessTime = now

@@ -315,6 +315,63 @@ func TestPeekWithExpiration(t *testing.T) {
 	})
 }
 
+func TestReturnExpired(t *testing.T) {
+	now := uint32(1000)
+	key := []byte("abcd")
+	val := []byte("efgh")
+
+	t.Run("default_does_not_return_expired", func(t *testing.T) {
+		timer := new(mockTimer)
+		timer.SetNowCallback(func() uint32 {
+			switch timer.NowCallsCount() {
+			case 1:
+				return now
+			case 2:
+				return now + 100
+			default:
+				return now
+			}
+		})
+		cache := NewCacheCustomTimer(1024, timer)
+		if err := cache.Set(key, val, 1); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		if _, err := cache.Get(key); err != ErrNotFound {
+			t.Fatalf("Get(expired): got %v, want ErrNotFound", err)
+		}
+	})
+
+	t.Run("config_returns_expired", func(t *testing.T) {
+		timer := new(mockTimer)
+		timer.SetNowCallback(func() uint32 {
+			switch timer.NowCallsCount() {
+			case 1:
+				return now
+			case 2:
+				return now + 100
+			default:
+				return now
+			}
+		})
+		cache := NewCache(1024, WithTimer(timer), WithReturnExpired())
+		if err := cache.Set(key, val, 1); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		got, err := cache.Get(key)
+		if err != nil {
+			t.Fatalf("Get(expired): %v", err)
+		}
+		if !bytes.Equal(got, val) {
+			t.Fatalf("value got %q, want %q", got, val)
+		}
+		if _, expireAt, err := cache.GetWithExpiration(key); err != nil {
+			t.Fatalf("GetWithExpiration: %v", err)
+		} else if want := now + 1; expireAt != want {
+			t.Fatalf("expireAt got %d, want %d", expireAt, want)
+		}
+	})
+}
+
 func TestMultiGet(t *testing.T) {
 	cache := NewCache(1024)
 	cache.Set([]byte("k1"), []byte("v1"), 0)

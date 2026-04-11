@@ -22,34 +22,68 @@ type Cache struct {
 	segments [segmentCount]segment
 }
 
+type cacheOptions struct {
+	timer         Timer
+	returnExpired bool
+}
+
+// CacheOption configures a cache during initialization.
+type CacheOption func(*cacheOptions)
+
+// WithTimer sets the clock used for TTL and LRU.
+// If nil is passed, the default timer (Unix seconds) is used.
+func WithTimer(timer Timer) CacheOption {
+	return func(o *cacheOptions) {
+		o.timer = timer
+	}
+}
+
+// WithReturnExpired causes Get-related lookups (Get, GetFn, MultiGet and etc.)
+// to return the stored value even when its TTL has expired, instead of
+// ErrNotFound. For those stale hits, access time and expiration metadata in
+// the entry are left unchanged (no LRU refresh on read). Expired entries may
+// still be removed during evacuation or when the cache explicitly deletes them.
+func WithReturnExpired() CacheOption {
+	return func(o *cacheOptions) {
+		o.returnExpired = true
+	}
+}
+
 type Updater func(value []byte, found bool) (newValue []byte, replace bool, expireSeconds int)
 
 func hashFunc(data []byte) uint64 {
 	return xxhash.Sum64(data)
 }
 
-// NewCache returns a newly initialize cache by size.
+// NewCache returns a newly initialized cache by size.
+// Optional settings are applied via CacheOption
+// (e.g. WithTimer, WithReturnExpired).
 // The cache size will be set to 512KB at minimum.
 // If the size is set relatively large, you should call
 // `debug.SetGCPercent()`, set it to a much smaller value
 // to limit the memory consumption and GC pause time.
-func NewCache(size int) (cache *Cache) {
-	return NewCacheCustomTimer(size, defaultTimer{})
-}
-
-// NewCacheCustomTimer returns new cache with custom timer.
-func NewCacheCustomTimer(size int, timer Timer) (cache *Cache) {
+func NewCache(size int, opts ...CacheOption) (cache *Cache) {
+	var o cacheOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	if size < minBufSize {
 		size = minBufSize
 	}
+	timer := o.timer
 	if timer == nil {
 		timer = defaultTimer{}
 	}
 	cache = new(Cache)
 	for i := 0; i < segmentCount; i++ {
-		cache.segments[i] = newSegment(size/segmentCount, i, timer)
+		cache.segments[i] = newSegment(size/segmentCount, i, timer, o.returnExpired)
 	}
 	return
+}
+
+// NewCacheCustomTimer returns new cache with custom timer.
+func NewCacheCustomTimer(size int, timer Timer) (cache *Cache) {
+	return NewCache(size, WithTimer(timer))
 }
 
 // Set sets a key, value and expiration for a cache entry and stores it in the cache.
