@@ -38,7 +38,7 @@ func WithTimer(timer Timer) CacheOption {
 	}
 }
 
-// WithReturnExpired causes Get-related lookups (Get, GetFn, MultiGet and etc.)
+// WithReturnExpired causes Get-related lookups (Get, GetFn, MultiGet, MultiGetWithExpiration, and etc.)
 // to return the stored value even when its TTL has expired, instead of
 // ErrNotFound. For those stale hits, access time and expiration metadata in
 // the entry are left unchanged (no LRU refresh on read). Expired entries may
@@ -120,6 +120,50 @@ func (cache *Cache) Get(key []byte) (value []byte, err error) {
 	return
 }
 
+type batchedKeyLoc struct {
+	idx     int
+	hashVal uint64
+}
+
+func groupKeysBySegment(keys [][]byte) [segmentCount][]batchedKeyLoc {
+	var groups [segmentCount][]batchedKeyLoc
+	for i, key := range keys {
+		hashVal := hashFunc(key)
+		segID := hashVal & segmentAndOpVal
+		groups[segID] = append(groups[segID], batchedKeyLoc{idx: i, hashVal: hashVal})
+	}
+	return groups
+}
+
+// multiGet implements batched lookups; withExpire controls whether expireAts is allocated
+// and filled. Caller must ensure len(keys) > 0.
+func (cache *Cache) multiGet(keys [][]byte, withExpire bool) (values [][]byte, expireAts []uint32, errs []error) {
+	n := len(keys)
+	values = make([][]byte, n)
+	errs = make([]error, n)
+	if withExpire {
+		expireAts = make([]uint32, n)
+	}
+	groups := groupKeysBySegment(keys)
+	for segID := 0; segID < segmentCount; segID++ {
+		batch := groups[segID]
+		if len(batch) == 0 {
+			continue
+		}
+		cache.locks[segID].Lock()
+		for _, loc := range batch {
+			value, expireAt, err := cache.segments[segID].get(keys[loc.idx], nil, loc.hashVal, false)
+			values[loc.idx] = value
+			errs[loc.idx] = err
+			if withExpire {
+				expireAts[loc.idx] = expireAt
+			}
+		}
+		cache.locks[segID].Unlock()
+	}
+	return values, expireAts, errs
+}
+
 // MultiGet returns values and errors for the given keys. The returned slices
 // have the same length as keys; values[i] and errs[i] correspond to keys[i].
 // A miss is represented by values[i] == nil and errs[i] == ErrNotFound.
@@ -129,43 +173,34 @@ func (cache *Cache) Get(key []byte) (value []byte, err error) {
 // the duration of all keys in that segment), which can increase Get tail
 // latency when MultiGet and Get run concurrently.
 func (cache *Cache) MultiGet(keys [][]byte) (values [][]byte, errs []error) {
-	n := len(keys)
-	if n == 0 {
+	if len(keys) == 0 {
 		return nil, nil
 	}
-	values = make([][]byte, n)
-	errs = make([]error, n)
-	type keyLoc struct {
-		idx     int
-		hashVal uint64
-	}
-	var groups [segmentCount][]keyLoc
-	for i, key := range keys {
-		hashVal := hashFunc(key)
-		segID := hashVal & segmentAndOpVal
-		groups[segID] = append(groups[segID], keyLoc{idx: i, hashVal: hashVal})
-	}
-	for segID := 0; segID < segmentCount; segID++ {
-		batch := groups[segID]
-		if len(batch) == 0 {
-			continue
-		}
-		cache.locks[segID].Lock()
-		for _, loc := range batch {
-			value, _, err := cache.segments[segID].get(keys[loc.idx], nil, loc.hashVal, false)
-			values[loc.idx] = value
-			errs[loc.idx] = err
-		}
-		cache.locks[segID].Unlock()
-	}
+	values, _, errs = cache.multiGet(keys, false)
 	return values, errs
+}
+
+// MultiGetWithExpiration returns values, expiration times, and errors for the given keys.
+// The returned slices have the same length as keys; values[i], expireAts[i], and errs[i]
+// correspond to keys[i]. A miss is represented by values[i] == nil, expireAts[i] == 0,
+// and errs[i] == ErrNotFound.
+// MultiGetWithExpiration reduces lock contention by grouping keys by segment and acquiring
+// each segment lock at most once.
+// Note that MultiGetWithExpiration holds each segment lock longer than a single
+// GetWithExpiration (for the duration of all keys in that segment), which can increase
+// Get tail latency when MultiGetWithExpiration and Get run concurrently.
+func (cache *Cache) MultiGetWithExpiration(keys [][]byte) (values [][]byte, expireAts []uint32, errs []error) {
+	if len(keys) == 0 {
+		return nil, nil, nil
+	}
+	return cache.multiGet(keys, true)
 }
 
 // GetFn is equivalent to Get or GetWithBuf, but it attempts to be zero-copy,
 // calling the provided function with slice view over the current underlying
 // value of the key in memory. The slice is constrained in length and capacity.
 //
-// In moth cases, this method will not alloc a byte buffer. The only exception
+// In most cases, this method will not alloc a byte buffer. The only exception
 // is when the value wraps around the underlying segment ring buffer.
 //
 // The method will return ErrNotFound is there's a miss, and the function will

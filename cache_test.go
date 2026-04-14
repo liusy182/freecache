@@ -407,6 +407,48 @@ func TestMultiGet(t *testing.T) {
 	}
 }
 
+func TestMultiGetWithExpiration(t *testing.T) {
+	now := uint32(1000)
+	key1 := []byte("k1")
+	key2 := []byte("k2")
+	val1 := []byte("v1")
+	val2 := []byte("v2")
+
+	timer := new(mockTimer)
+	timer.SetNowCallback(func() uint32 { return now })
+	cache := NewCacheCustomTimer(1024, timer)
+	if err := cache.Set(key1, val1, 60); err != nil {
+		t.Fatalf("Set k1: %v", err)
+	}
+	if err := cache.Set(key2, val2, 120); err != nil {
+		t.Fatalf("Set k2: %v", err)
+	}
+
+	keys := [][]byte{key1, key2, []byte("missing")}
+	values, expireAts, errs := cache.MultiGetWithExpiration(keys)
+	if len(values) != len(keys) || len(expireAts) != len(keys) || len(errs) != len(keys) {
+		t.Fatalf("len mismatch: values=%d, expireAts=%d, errs=%d, want %d", len(values), len(expireAts), len(errs), len(keys))
+	}
+	if errs[0] != nil || !bytes.Equal(values[0], val1) || expireAts[0] != now+60 {
+		t.Errorf("keys[0]: value=%q, expireAt=%d, err=%v", values[0], expireAts[0], errs[0])
+	}
+	if errs[1] != nil || !bytes.Equal(values[1], val2) || expireAts[1] != now+120 {
+		t.Errorf("keys[1]: value=%q, expireAt=%d, err=%v", values[1], expireAts[1], errs[1])
+	}
+	if errs[2] != ErrNotFound || values[2] != nil || expireAts[2] != 0 {
+		t.Errorf("keys[2] (missing): value=%v, expireAt=%d, err=%v", values[2], expireAts[2], errs[2])
+	}
+
+	values, expireAts, errs = cache.MultiGetWithExpiration(nil)
+	if values != nil || expireAts != nil || errs != nil {
+		t.Errorf("MultiGetWithExpiration(nil): got values=%v, expireAts=%v, errs=%v", values, expireAts, errs)
+	}
+	values, expireAts, errs = cache.MultiGetWithExpiration([][]byte{})
+	if values != nil || expireAts != nil || errs != nil {
+		t.Errorf("MultiGetWithExpiration(empty): got values=%v, expireAts=%v, errs=%v", values, expireAts, errs)
+	}
+}
+
 func TestGetWithExpirationAndBuf(t *testing.T) {
 	cache := NewCache(1024)
 	key := []byte("abcd")
